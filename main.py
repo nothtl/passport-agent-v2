@@ -51,13 +51,16 @@ PILLAR_LABELS = {
 # LLM helper — direct API call for simple scoring prompts
 # ═══════════════════════════════════════════════════════════════
 
-def _llm_json(prompt: str, temperature: float = 0.0) -> dict:
+def _llm_json(prompt: str, temperature: float = 0.0, max_tokens: int = None) -> dict:
     """Quick single LLM call expecting JSON response. No tool loop."""
+    if max_tokens is None:
+        # DeepSeek V4 Flash uses reasoning tokens — need headroom for long prompts
+        max_tokens = max(4096, int(len(prompt) / 2) + 2000)
     messages = [
         {"role": "system", "content": "Return ONLY valid JSON, no markdown, no preamble."},
         {"role": "user", "content": prompt},
     ]
-    resp = _call_api(messages=messages, temperature=temperature, max_tokens=4096)
+    resp = _call_api(messages=messages, temperature=temperature, max_tokens=max_tokens)
     if "error" in resp:
         return resp
     content = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -134,67 +137,26 @@ async def run_new_pipeline_full(student_name: str) -> dict:
     else:
         print(f"[NEW] Warning: No Agent 1 data found, using empty fields")
 
-    # ── Enrich missing survey fields from documents FIRST ────
-    print("[NEW] Enriching missing survey fields from documents...")
+    # ── Enrich missing survey fields via LLM from documents ──
+    print("[NEW] Enriching missing survey fields via LLM...")
+    from pillars.enricher import enrich_all
     old_a2 = os.path.join(OLD_ROOT, "agent2", "outputs", f"{slug}_survey_scores.json")
     missing_fields = []
     if os.path.exists(old_a2):
         with open(old_a2, encoding="utf-8") as f:
             missing_fields = json.load(f).get("missing_fields", [])
 
-    # Concept extraction: map field names to search concepts
-    CONCEPT_MAP = {
-        "community": ["Community Feel", "Pre Community Connected", "community"],
-        "volunteer": ["FY1 Ever Volunteered", "Hours Volunteered", "volunteer"],
-        "conflict": ["Deal with conflicts", "conflict management", "conflict"],
-        "listen": ["Listen to others", "listening", "active listening"],
-        "include": ["Include others", "diversity and inclusion", "cross-cultural"],
-        "empathy": ["Pre Empathy", "Pre Humble", "empathy"],
-        "leadership": ["Pre Lead With Authenticity", "leadership", "leader"],
-        "reflect": ["Reflect if you have been", "reflection", "reflect"],
-        "career": ["Know How To Pursue Careers", "career", "professional"],
-        "college": ["FY1 Feel College Ready", "college ready", "college prep"],
-        "network": ["How many individuals", "network", "professional contacts"],
-        "cultural": ["I understand how my cultural values", "cultural", "Culture Feel"],
-        "champion": ["After meeting Champions", "diverse career professionals", "Champion"],
-        "school": ["Meeting with my Champions during school", "engaged in school", "belong in school"],
-        "friends": ["I made new friends", "friends", "social"],
-        "stronger": ["stronger candidate", "more prepared", "career goals", "realize doing well"],
-        "speaker": ["The Speaker inspired", "Speaker helped", "Speaker was a relatable", "topic inspired", "topic helped"],
-    }
-
     enriched = {}
-    for field in missing_fields[:30]:
-        field_lower = field.lower()
-        # Find matching concept
-        for concept, keywords in CONCEPT_MAP.items():
-            if any(kw.lower() in field_lower for kw in keywords):
-                result = search_evidence(query=" OR ".join(keywords[:3]), source="all", student_name=student_name)
-                if result.get("total_count", 0) > 0:
-                    enriched[field] = {
-                        "value": result["matches"][0]["matched_text"][:200],
-                        "source": result["matches"][0]["source"],
-                        "was_missing": True,
-                    }
-                    # Also add to fields dict for scoring
-                    if field == "FY1 Ever Volunteered":
-                        fields[field] = "True"  # evidence found = volunteered
-                    elif "Hours Volunteered" in field:
-                        fields[field] = "10-20"  # moderate
-                    elif "Community Feel" in field:
-                        # Estimate from community roles
-                        cr = count_distinct(source="linkedin", pattern="community_orgs", student_name=student_name)
-                        if cr.get("count", 0) > 0:
-                            fields[field] = min(cr["count"] + 2, 7)
-                    else:
-                        # For Likert fields, set a moderate value when evidence exists
-                        if any(kw in field_lower for kw in ["listen", "include", "conflict", "empathy", "humble", "lead", "reflect"]):
-                            fields[field] = 4  # moderate score when evidence found
-                        elif any(kw in field_lower for kw in ["cultural", "career", "college", "network", "school", "champion"]):
-                            fields[field] = 4  # moderate
-                break
-
-    print(f"[NEW] Enriched {len(enriched)} fields from documents")
+    if missing_fields:
+        enriched, fields = enrich_all(
+            student_name=student_name,
+            missing_fields=missing_fields,
+            linkedin_text=linkedin_text,
+            resume_text=resume_text,
+            fields=fields,
+            llm_call=_llm_json,
+        )
+    print(f"[NEW] Enriched {len(enriched)} fields via LLM")
 
     # ── Score all pillars ──────────────────────────────────
     all_scores = {}
@@ -277,10 +239,13 @@ Return JSON: {{"score": <int 1-5>, "justification": "<one sentence>"}}""".replac
 
     # CT — Holistic LLM with evidence
     print("[NEW] Scoring CT & CI...")
-    ct_prompt = CT_PROMPT.replace("{linkedin_text}", linkedin_text[:2500] or "none")\
-                          .replace("{resume_text}", resume_text[:2500] or "none")\
+    ct_prompt = CT_PROMPT.replace("{linkedin_text}", linkedin_text[:1500] or "none")\
+                          .replace("{resume_text}", resume_text[:1500] or "none")\
                           .replace("{github_text}", "none")
     ct_result = _llm_json(ct_prompt)
+    # Retry with longer context if empty
+    if ct_result.get("ct_score", 0) == 0 and ct_result.get("thinking_arc", "") == "":
+        ct_result = _llm_json(ct_prompt)  # retry once
     all_scores["CT"] = {
         "score": int(ct_result.get("ct_score", 0)),
         "thinking_arc": ct_result.get("thinking_arc", ""),
@@ -303,24 +268,6 @@ Return JSON: {{"score": <int 1-5>, "justification": "<one sentence>"}}""".replac
         "innovation_signal": ci_result.get("innovation_signal", "developing"),
     }
 
-    # ── Enriched fields ───────────────────────────────────
-    print("[NEW] Enriching missing survey fields...")
-    old_a2 = os.path.join(OLD_ROOT, "agent2", "outputs", f"{slug}_survey_scores.json")
-    missing_fields = []
-    if os.path.exists(old_a2):
-        with open(old_a2, encoding="utf-8") as f:
-            missing_fields = json.load(f).get("missing_fields", [])
-
-    enriched = {}
-    for field in missing_fields[:15]:  # Cap at 15 to save time
-        result = search_evidence(query=field, source="all", student_name=student_name)
-        if result.get("total_count", 0) > 0:
-            enriched[field] = {
-                "value": result["matches"][0]["matched_text"][:200],
-                "source": result["matches"][0]["source"],
-                "was_missing": True,
-            }
-
     # ── Assemble output ───────────────────────────────────
     usage = get_usage()
     elapsed = round(time.time() - start, 1)
@@ -330,9 +277,10 @@ Return JSON: {{"score": <int 1-5>, "justification": "<one sentence>"}}""".replac
         "pipeline": "new (tool-using agent, all 6 pillars)",
         "model": OPENCODE_MODEL,
         "scores": all_scores,
-        "enriched_fields": enriched,
+        "enriched_fields": {k: {"value": v, "source": "llm_inferred", "was_missing": True}
+                             for k, v in enriched.items()},
         "fields_enriched": len(enriched),
-        "fields_still_missing": max(0, len(missing_fields) - len(enriched)),
+        "fields_still_missing": max(0, len(missing_fields) - len(enriched)) if missing_fields else 0,
         "usage": usage,
         "elapsed_seconds": elapsed,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
