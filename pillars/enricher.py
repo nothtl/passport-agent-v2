@@ -139,16 +139,18 @@ def enrich_all(student_name: str, missing_fields: list[str], linkedin_text: str,
     for key in ["listen", "conflict", "include", "reflect"]:
         if key in interp and isinstance(interp[key], (int, float)):
             field_map = {
-                "listen": "Listen to others (post)",
-                "conflict": "Deal with conflicts - conflict management",
-                "include": "Include others who are different - diversity and inclusion",
-                "reflect": "Reflect if you have been in a similar situation as someone you are trying to help non positional leadership",
+                "listen": ["Listen to others (post)", "Listen to others"],
+                "conflict": ["Deal with conflicts - conflict management",
+                             "Deal with conflicts with other people conflict management"],
+                "include": ["Include others who are different - diversity and inclusion",
+                            "Include others who are different from you diversity and inclusion"],
+                "reflect": ["Reflect if you have been in a similar situation as someone you are trying to help non positional leadership"],
             }
-            field_name = field_map.get(key)
-            if field_name and field_name in missing_fields:
-                val = max(1, min(7, int(interp[key])))
-                enriched[field_name] = val
-                fields[field_name] = val
+            for field_name in field_map.get(key, []):
+                if field_name in missing_fields:
+                    val = max(1, min(7, int(interp[key])))
+                    enriched[field_name] = val
+                    fields[field_name] = val
 
     # ── EC: Pre-program scores ──────────────────────────────────
     pre_prompt = EC_PRE_PROMPT.format(
@@ -240,11 +242,31 @@ def enrich_all(student_name: str, missing_fields: list[str], linkedin_text: str,
         enriched["Languages"] = str(lang["languages"])
         fields["Languages"] = str(lang["languages"])
 
+    # ── Champion variant (long name) ────────────────────────────
+    champion_variant = "After meeting Champions and working with other peers in my SPEAKHIRE Internship Rounds I better understand people who are different from me"
+    if champion_variant in missing_fields:
+        # Copy from short-name variant if we already set it
+        short_name = "After meeting Champions, I better understand people who are different from me"
+        if short_name in fields:
+            enriched[champion_variant] = fields[short_name]
+            fields[champion_variant] = fields[short_name]
+
+    # ── Text fields from CPC session ────────────────────────────
+    text_fields_from_cpc = [
+        "Any suggestions to make the Foundational Year a better experience",
+        "Did you learn something about other careers from other Career Cohorts",
+    ]
+    for tf in text_fields_from_cpc:
+        if tf in missing_fields and cpc_text.strip():
+            enriched[tf] = cpc_text[:300]
+            fields[tf] = cpc_text[:300]
+
     # ── Cultural understanding fields ──────────────────────────
     if "is_multilingual" in lang:
         cultural_fields = [
             "I understand how my cultural values can shape my career choices",
             "After meeting Champions, I better understand people who are different from me",
+            "After meeting Champions and working with other peers in my SPEAKHIRE Internship Rounds I better understand people who are different from me",
         ]
         for cf in cultural_fields:
             if cf in missing_fields:
@@ -266,7 +288,28 @@ def enrich_all(student_name: str, missing_fields: list[str], linkedin_text: str,
                 enriched[sf] = val
                 fields[sf] = val
 
-    # ── Network value from network_estimate ────────────────────
+    # ── Force-enrich: any GC fields still missing, fill from detection or defaults
+    gc_force_fields = {
+        "Community Feel (Quant)": lambda d: min(int(d.get("community_roles_count", 1)) + 2, 7),
+        "FY helped realize doing well connects to my career goals": lambda d: "1.0" if d.get("has_college_discussion") in (True, "true", 1) else "0.0",
+        "How many individuals do you know who work in the career you are interested in": lambda d: int(d.get("network_estimate", 2)),
+        "I feel I am now a stronger candidate for college and careers": lambda d: round(float(d.get("smart_goal_quality", 0.5)) * 10, 1),
+        "I feel I am now more prepared for college": lambda d: round(float(d.get("smart_goal_quality", 0.5)) * 10, 1),
+        "I feel more engaged in school and participate more than before": lambda d: "True" if d.get("has_campus_role") in (True, "true", 1) else "False",
+        "I made new friends during the Foundational Year": lambda d: "True" if d.get("has_campus_role") in (True, "true", 1) else "False",
+        "Know How To Pursue Careers": lambda d: min(int(d.get("network_estimate", 2)) + 2, 7),
+        "Meeting with my Champions during school helped me feel like I belong in school": lambda d: "True" if d.get("has_campus_role") in (True, "true", 1) else "False",
+        "This SPEAKHIRE Foundational Year helped me understand the value of building a strong network": lambda d: "True" if int(d.get("network_estimate", 0)) >= 3 else "False",
+    }
+
+    for field_name, resolver in gc_force_fields.items():
+        if field_name in missing_fields:
+            try:
+                val = resolver(detect)
+                enriched[field_name] = val
+                fields[field_name] = val
+            except Exception:
+                pass
     if "network_estimate" in detect and "This SPEAKHIRE Foundational Year helped me understand the value of building a strong network" in missing_fields:
         net = int(detect.get("network_estimate", 0))
         fields["This SPEAKHIRE Foundational Year helped me understand the value of building a strong network"] = "True" if net >= 3 else "False"

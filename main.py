@@ -286,8 +286,7 @@ Return JSON: {{"score": <int 1-5>, "justification": "<one sentence>"}}""".replac
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
 
-    out_path = os.path.join(OUTPUTS_DIR, "students", f"{slug}.json")
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    out_path = os.path.join(OUTPUTS_DIR, f"{slug}.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False, default=str)
 
