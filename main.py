@@ -272,19 +272,25 @@ Return JSON: {{"score": <int 1-5>, "justification": "<one sentence>"}}""".replac
     usage = get_usage()
     elapsed = round(time.time() - start, 1)
 
-    output = {
-        "student_name": student_name,
-        "pipeline": "new (tool-using agent, all 6 pillars)",
-        "model": OPENCODE_MODEL,
-        "scores": all_scores,
-        "enriched_fields": {k: {"value": v, "source": "llm_inferred", "was_missing": True}
-                             for k, v in enriched.items()},
-        "fields_enriched": len(enriched),
-        "fields_still_missing": max(0, len(missing_fields) - len(enriched)) if missing_fields else 0,
-        "usage": usage,
-        "elapsed_seconds": elapsed,
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-    }
+    # ── Convert to old format for compatibility ────────────
+    a1_data = None
+    if os.path.exists(old_a1):
+        with open(old_a1, encoding="utf-8") as f:
+            a1_data = json.load(f)
+    a2_data = {}
+    if os.path.exists(old_a2):
+        with open(old_a2, encoding="utf-8") as f:
+            a2_data = json.load(f)
+
+    output = _make_old_format(
+        student_name=student_name,
+        all_scores=all_scores,
+        enriched=enriched,
+        old_a1_data=a1_data,
+        old_a2_data=a2_data,
+        usage=usage,
+        elapsed=elapsed,
+    )
 
     out_path = os.path.join(OUTPUTS_DIR, f"{slug}.json")
     with open(out_path, "w", encoding="utf-8") as f:
@@ -390,6 +396,83 @@ async def main():
     print(f"\nEnriched fields: Old={len(old_result.get('enriched_fields',{}))}, New={new_result.get('fields_enriched',0)}")
     print(f"LLM calls: Old={old_result.get('llm_calls','?')}, New={new_result['usage']['calls']}")
     print(f"Time: New={new_result['elapsed_seconds']}s")
+
+
+def _make_old_format(student_name, all_scores, enriched, old_a1_data, old_a2_data, usage, elapsed=0):
+    """Convert new pipeline output to match old pipeline format exactly."""
+    email = ""
+    if old_a1_data:
+        email = old_a1_data.get("email", "")
+
+    # Compute per-pillar data_coverage from old_a1 if available
+    def _coverage(pillar_key):
+        if not old_a1_data:
+            return 0.0
+        raw_fields = old_a1_data.get("fields", {})
+        pillar_fields = {k: v for k, v in raw_fields.items() if v.get("pillar") == pillar_key}
+        if not pillar_fields:
+            return 0.0
+        found = sum(1 for v in pillar_fields.values() if v.get("status") == "found")
+        return round(found / len(pillar_fields), 2)
+
+    # Build per-pillar scores in old format
+    old_scores = {}
+    for pillar in ["EC", "GC", "RFF", "CR", "CT", "CI"]:
+        new_data = all_scores.get(pillar, {})
+        entry = {
+            "score": new_data.get("score", 0),
+            "source": "survey+docs",
+        }
+        # Only formula pillars have sub_scores and data_coverage
+        if pillar in ["EC", "GC", "RFF", "CR"]:
+            entry["sub_scores"] = new_data.get("sub_scores", {})
+            entry["data_coverage"] = _coverage(pillar)
+        # Add pillar-specific narrative fields
+        if pillar == "CT":
+            entry["thinking_arc"] = new_data.get("thinking_arc", "")
+            entry["key_evidence"] = new_data.get("key_evidence", "")
+            entry["depth_signal"] = new_data.get("depth_signal", "developing")
+            entry["reasoning"] = new_data.get("thinking_arc", "")
+        elif pillar == "CI":
+            entry["innovation_arc"] = new_data.get("innovation_arc", "")
+            entry["key_evidence"] = new_data.get("key_evidence", "")
+            entry["innovation_signal"] = new_data.get("innovation_signal", "developing")
+            entry["reasoning"] = new_data.get("innovation_arc", "")
+        else:
+            subs = new_data.get("sub_scores", {})
+            if subs:
+                entry["reasoning"] = f"{student_name} demonstrates competency in {pillar} scoring {entry['score']}."
+            else:
+                entry["reasoning"] = f"Score derived from {entry['source']}."
+        old_scores[pillar] = entry
+
+    # Build enriched_fields in old format
+    old_enriched = {}
+    for k, v in enriched.items():
+        old_enriched[k] = {
+            "value": v,
+            "source": "docs",
+            "was_missing": True,
+        }
+
+    missing_fields = old_a2_data.get("missing_fields", []) if old_a2_data else []
+
+    still_missing = [f for f in missing_fields if f not in enriched]
+
+    return {
+        "student_name": student_name,
+        "email": email,
+        "scores": old_scores,
+        "enriched_fields": old_enriched,
+        "fields_enriched_count": len(enriched),
+        "fields_still_missing": still_missing,
+        "llm_calls_made": usage["calls"],
+        "_new_pipeline_metadata": {
+            "model": OPENCODE_MODEL,
+            "elapsed_seconds": elapsed,
+            "usage": usage,
+        },
+    }
 
 
 if __name__ == "__main__":
